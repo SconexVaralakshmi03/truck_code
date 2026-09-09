@@ -1,0 +1,10 @@
+opencv-python
+numpy
+mediapipe
+ultralytics
+torch
+torchvision
+torchaudio
+fastapi
+uvicorn[standard]
+websockets

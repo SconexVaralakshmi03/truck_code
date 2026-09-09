@@ -1,0 +1,35 @@
+# Ignore python virtual environments
+venv/
+.venv/
+env/
+
+# Ignore python cache files
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Ignore generated logs and outputs
+logs/
+outputs/
+*.log
+
+# Ignore OS/editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Ignore large/generated ML artifacts
+*.pt
+models/
+
+# Ignore local environment and test metadata
+.env
+*.sqlite3
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Ignore local voice/screenshot/test artifacts if generated
+*.jpg
+*.jpeg
+*.png
