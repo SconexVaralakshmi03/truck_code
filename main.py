@@ -127,6 +127,19 @@ NORMAL_STATUS_INTERVAL_SECONDS = 0.5
 # without limit or stall the WebSocket receive loop.
 TASK_QUEUE_MAXSIZE = 12
 
+# Message types that get printed to the server terminal at the exact
+# moment they are sent to a camera's mobile app, so you can see on the
+# backend side what the app is receiving. Routine heartbeats
+# (DETECTION_STATUS) are deliberately excluded -- they fire every
+# NORMAL_STATUS_INTERVAL_SECONDS per camera per domain and would flood
+# the log; only real alert/clear events are printed.
+ALERT_MESSAGE_TYPES = {
+    "DROWSINESS_ALERT",
+    "DROWSINESS_CLEARED",
+    "PHONE_ALERT",
+    "PHONE_CLEARED",
+}
+
 
 # =============================================================================
 # CAMERA WORKER -- one dedicated process per connected camera
@@ -650,6 +663,12 @@ async def video_receiver(websocket: WebSocket):
         async def sender_loop():
             while True:
                 message = await out_queue.get()
+                if message.get("type") in ALERT_MESSAGE_TYPES:
+                    print(
+                        f"[camera-worker '{camera_id}'] -> SENDING TO APP "
+                        f"({message['type']}): {message}",
+                        flush=True,
+                    )
                 await websocket.send_json(message)
 
         sender_task = asyncio.create_task(sender_loop())
