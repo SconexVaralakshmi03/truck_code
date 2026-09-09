@@ -6,63 +6,66 @@ Live, multi-camera backend for the Truck Driver Safety POC.
 WHAT THIS FILE IS
 ------------------
 This is the ONLY new/changed file. It does NOT modify:
-    - src/drowsiness.py
-    - src/drowsiness_geometric.py
-    - src/phone_detection.py
+    - src/drowsiness.py, src/drowsiness_geometric.py, src/phone_detection.py
     - src/detector_base.py, src/event_manager.py, src/pose_utils.py, ...
     - config.py
     - drowsiness_mobile_poc.py   (its TemporalViolation class is imported
                                    and reused as-is, not rewritten)
 
-All detection logic (classifier + MediaPipe EAR/MAR/PERCLOS geometric
-cross-check for drowsiness, classifier + YOLOv8 + posture cascade for
-phone usage, and the START/sustained/END/cooldown temporal state machine)
-is untouched. This file only adds the *live* API/serving layer on top of
-that existing logic, using the same WebSocket protocol style as the
-reference implementation you supplied (START_STREAM registration,
-STREAM_STARTED ack, DETECTION_STATUS heartbeats, *_ALERT events, /health).
+ARCHITECTURE (v5 -- one dedicated GPU worker process per camera)
+------------------------------------------------------------------
+Earlier versions of this file used exactly 2 worker processes total (one
+for drowsiness, one for phone), each serving every connected camera in
+turn. That meant 3 cameras streaming at once would queue up behind each
+other inside a single process.
 
-WHAT'S NEW HERE
-----------------
-1. TRUE PARALLELISM, 2 DEDICATED WORKERS
-   Two separate OS processes are started at server startup:
-     - one process runs ONLY drowsiness detection (classifier + geometric)
-     - one process runs ONLY phone-usage detection (classifier + YOLO +
-       posture)
-   Because they are separate processes (not threads), they run on
-   separate CPU cores in true parallel -- the phone detector is never
-   blocked waiting on the drowsiness detector or vice versa, so alerts
-   for each are produced as fast as each pipeline allows.
+This version flips that around, per your request:
 
-2. MULTI-CAMERA (up to MAX_CONCURRENT_CAMERAS, default 3)
-   Every camera connection gets its own fully independent detector state
-   (its own EAR baseline, its own temporal START/END timers, its own
-   cooldowns) inside each worker process -- exactly the same isolation
-   the original single-video script had per video, just keyed by
-   camera_id instead of by file. Camera A's drowsy timer can never bleed
-   into camera B's.
+    1 camera stream == 1 dedicated OS process (a "camera worker"),
+    started the moment that camera connects and torn down the moment
+    it disconnects.
 
-3. PER-CAMERA ROUTING
-   Every frame carries its connection_id/camera_id all the way through
-   both worker processes and back. A background dispatcher thread reads
-   each worker's result queue and pushes the result straight into that
-   specific camera's own outgoing asyncio.Queue, which a per-connection
-   sender task immediately flushes to that camera's own WebSocket. There
-   is no polling delay and no cross-camera mixing -- each camera gets its
-   alert the moment its own detection result is ready.
+    Up to MAX_CONCURRENT_CAMERAS such processes run at once (default 3,
+    set the env var to 4 or more if your GPU has room -- see below).
+    Because each is a real OS process, Driver A's stream is never stuck
+    waiting behind Driver B's or Driver C's frames -- all cameras are
+    processed truly in parallel, each getting alerts the instant its own
+    worker produces them.
+
+    INSIDE each camera worker, the two detection pipelines also run in
+    parallel with each other, via a 2-thread pool:
+        thread 1: DrowsinessDetector + GeometricDrowsinessDetector
+                  (combined exactly per config.DROWSINESS_COMBINE_MODE)
+        thread 2: PhoneDetector (classifier -> YOLOv8 -> posture cascade)
+    Both threads work on the SAME frame concurrently. torch/opencv/
+    mediapipe/ultralytics all release the GIL during their heavy
+    C/CUDA compute, so these two threads genuinely overlap instead of
+    serializing -- especially important on a GPU worker, where each
+    thread's "work" is mostly waiting on a CUDA kernel/queue rather than
+    holding the GIL. Whichever pipeline finishes first (e.g. drowsiness)
+    has its alert pushed out immediately -- it does not wait for the
+    slower pipeline to also finish.
+
+So for 3 (or 4) simultaneous drivers, you get 3 (or 4) processes x 2
+threads each = true stream-level AND detector-level parallelism, and a
+drowsiness alert for Driver B can never be delayed by a phone-detection
+computation for Driver A or C.
 
 HOW TO RUN
 ----------
     pip install -r requirements.txt
     python main.py
-        (starts uvicorn on 0.0.0.0:8000, same as: uvicorn main:app --host 0.0.0.0 --port 8000)
+        (or: uvicorn main:app --host 0.0.0.0 --port 8000)
 
-WebSocket clients connect exactly like the reference implementation:
-    ws://<host>:8000/video
-    -> send JSON  {"type": "START_STREAM", "user_id": "...", "user_name": "...", "camera_id": "..."}
-    <- receive JSON {"type": "STREAM_STARTED", ...}
-    -> send binary JPEG frames, one per message, forever
-    <- receive JSON status/alert messages as they occur
+Set MAX_CONCURRENT_CAMERAS=4 (or higher) as an env var to raise the cap,
+and DRIVER_SAFETY_DEVICE=cuda to run each worker's models on GPU.
+
+WebSocket protocol (same style you've been using):
+    ws(s)://<host>:8000/video
+    -> {"type": "START_STREAM", "user_id": "...", "user_name": "...", "camera_id": "..."}
+    <- {"type": "STREAM_STARTED", ...}
+    -> binary JPEG frames, one per message, forever
+    <- JSON status/alert messages as they occur
 """
 
 from __future__ import annotations
@@ -74,6 +77,7 @@ import queue
 import asyncio
 import threading
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,7 +87,6 @@ import cv2
 import numpy as np
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 
 
 # =============================================================================
@@ -112,209 +115,50 @@ PHONE_YOLO_FALLBACK_MODEL_PATH = os.environ.get(
     "PHONE_YOLO_FALLBACK_MODEL_PATH", str(SCRIPT_DIR / "yolov8m.pt")
 )
 
-# How many camera connections are allowed at the same time.
+# How many camera workers (== how many simultaneous drivers) are allowed
+# at once. Start at 3, raise to 4+ once you've confirmed your GPU has
+# memory headroom for another full set of models.
 MAX_CONCURRENT_CAMERAS = int(os.environ.get("MAX_CONCURRENT_CAMERAS", "3"))
 
 # How frequently a heartbeat/normal status is sent per camera per domain.
 NORMAL_STATUS_INTERVAL_SECONDS = 0.5
 
-# Bounded queues so a slow/backed-up worker can never grow memory without
-# limit or stall the event loop. If a queue is full we drop that single
-# frame for that domain only (the other domain still gets it) rather than
-# blocking the WebSocket receive loop.
+# Bounded per-camera task queue so a stalled worker can't grow memory
+# without limit or stall the WebSocket receive loop.
 TASK_QUEUE_MAXSIZE = 12
 
 
 # =============================================================================
-# MULTIPROCESSING PRIMITIVES (created at import time; workers are started
-# in the FastAPI lifespan handler below)
+# CAMERA WORKER -- one dedicated process per connected camera
 # =============================================================================
 
-task_queue_drowsy: mp.Queue = mp.Queue(maxsize=TASK_QUEUE_MAXSIZE)
-task_queue_phone: mp.Queue = mp.Queue(maxsize=TASK_QUEUE_MAXSIZE)
-
-result_queue_drowsy: mp.Queue = mp.Queue()
-result_queue_phone: mp.Queue = mp.Queue()
-
-drowsy_process: Optional[mp.Process] = None
-phone_process: Optional[mp.Process] = None
-
-drowsy_dispatcher_thread: Optional[threading.Thread] = None
-phone_dispatcher_thread: Optional[threading.Thread] = None
-
-
-# =============================================================================
-# WORKER 1 -- DROWSINESS ONLY (runs in its own process)
-# =============================================================================
-
-def drowsiness_worker_process(task_q, result_q, drowsy_model_path, device):
+def camera_worker_process(
+    task_q,
+    result_q,
+    camera_id: str,
+    user_name: str,
+    drowsy_model_path: str,
+    phone_model_path: str,
+    phone_yolo_path: str,
+    device: str,
+):
     """
-    Dedicated worker process for DROWSINESS detection only.
+    Runs for the entire lifetime of ONE camera connection. Loads its own
+    copy of every detector once, then for every incoming frame runs the
+    drowsiness pipeline and the phone pipeline in parallel threads,
+    pushing each domain's result to result_q the instant it's ready.
 
     Reuses, unmodified:
-        src.drowsiness.DrowsinessDetector          (classifier)
-        src.drowsiness_geometric.GeometricDrowsinessDetector (EAR/MAR/PERCLOS)
-        drowsiness_mobile_poc.TemporalViolation      (combine + START/END)
-        config.DROWSINESS_COMBINE_MODE / DROWSINESS_COOLDOWN
-
-    Maintains one full detector set PER camera_id, created lazily on that
-    camera's first frame, so every camera keeps a completely independent
-    EAR baseline and temporal timer -- identical isolation to the original
-    single-video POC script, just keyed by camera instead of by file.
+        src.drowsiness.DrowsinessDetector
+        src.drowsiness_geometric.GeometricDrowsinessDetector
+        src.phone_detection.PhoneDetector
+        drowsiness_mobile_poc.TemporalViolation
+        config.DROWSINESS_COMBINE_MODE / DROWSINESS_COOLDOWN / PHONE_COOLDOWN
     """
-    print(f"[drowsiness-worker pid={os.getpid()}] starting", flush=True)
+    print(f"[camera-worker '{camera_id}' pid={os.getpid()}] starting", flush=True)
 
     from src.drowsiness import DrowsinessDetector
     from src.drowsiness_geometric import GeometricDrowsinessDetector
-    from drowsiness_mobile_poc import TemporalViolation
-    import config as cfg
-
-    camera_state = {}
-
-    def get_state(camera_id):
-        if camera_id not in camera_state:
-            classifier = None
-            if drowsy_model_path and os.path.exists(drowsy_model_path):
-                try:
-                    classifier = DrowsinessDetector(drowsy_model_path, device=device)
-                    print(
-                        f"[drowsiness-worker] classifier loaded for camera '{camera_id}'",
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(
-                        f"[drowsiness-worker] classifier disabled for "
-                        f"'{camera_id}': {exc!r}",
-                        flush=True,
-                    )
-            else:
-                print(
-                    f"[drowsiness-worker] no drowsiness model found, "
-                    f"'{camera_id}' will use geometric detector only",
-                    flush=True,
-                )
-
-            camera_state[camera_id] = {
-                "classifier": classifier,
-                "geometric": GeometricDrowsinessDetector(),
-                "temporal": TemporalViolation(
-                    "DROWSINESS", 0.0, cfg.DROWSINESS_COOLDOWN
-                ),
-                "last_status_at": 0.0,
-            }
-        return camera_state[camera_id]
-
-    while True:
-        task = task_q.get()  # blocks until a frame (or control/shutdown) arrives
-
-        if task is None:
-            print("[drowsiness-worker] shutdown signal received", flush=True)
-            break
-
-        if task.get("control") == "REMOVE_CAMERA":
-            camera_state.pop(task["camera_id"], None)
-            print(
-                f"[drowsiness-worker] released state for camera "
-                f"'{task['camera_id']}'",
-                flush=True,
-            )
-            continue
-
-        camera_id = task["camera_id"]
-
-        try:
-            frame = cv2.imdecode(
-                np.frombuffer(task["frame_bytes"], dtype=np.uint8),
-                cv2.IMREAD_COLOR,
-            )
-            if frame is None:
-                continue
-
-            video_time = task["video_time"]
-            state = get_state(camera_id)
-
-            if state["classifier"] is not None:
-                d = state["classifier"].process_frame(frame, video_time)
-            else:
-                d = {
-                    "label": "DISABLED",
-                    "confidence": 0.0,
-                    "sustained_active": False,
-                    "event": None,
-                }
-
-            geo = state["geometric"].process_frame(frame, video_time)
-
-            classifier_active = bool(d.get("sustained_active", False))
-            geometric_active = bool(geo.get("sustained_active", False))
-
-            if cfg.DROWSINESS_COMBINE_MODE.upper() == "AND":
-                condition = classifier_active and geometric_active
-            else:
-                # Default POC behavior: either signal triggers.
-                condition = classifier_active or geometric_active
-
-            confidence = float(d.get("confidence", 0.0) or 0.0)
-            event = state["temporal"].update(condition, video_time, confidence)
-
-            now = time.monotonic()
-            is_heartbeat_due = (
-                now - state["last_status_at"] >= NORMAL_STATUS_INTERVAL_SECONDS
-            )
-
-            if event is None and not is_heartbeat_due:
-                continue  # nothing worth sending yet
-
-            state["last_status_at"] = now
-
-            if event == "START":
-                print(
-                    f"[drowsiness-worker] 🚨 DROWSINESS START camera="
-                    f"{camera_id} conf={confidence:.3f}",
-                    flush=True,
-                )
-
-            result_q.put(
-                {
-                    "domain": "drowsiness",
-                    "connection_id": task["connection_id"],
-                    "camera_id": camera_id,
-                    "user_name": task["user_name"],
-                    "event": event,
-                    "active": state["temporal"].active,
-                    "label": d.get("label"),
-                    "confidence": round(confidence, 4),
-                    "peak_confidence": round(state["temporal"].peak_confidence, 4),
-                    "ear": geo.get("ear"),
-                    "perclos": geo.get("perclos"),
-                }
-            )
-
-        except Exception as exc:
-            print(
-                f"[drowsiness-worker] ERROR on camera '{camera_id}': {exc!r}",
-                flush=True,
-            )
-
-
-# =============================================================================
-# WORKER 2 -- PHONE USAGE ONLY (runs in its own process)
-# =============================================================================
-
-def phone_worker_process(task_q, result_q, phone_model_path, phone_yolo_path, device):
-    """
-    Dedicated worker process for PHONE-USAGE detection only.
-
-    Reuses, unmodified:
-        src.phone_detection.PhoneDetector    (classifier -> YOLOv8 -> posture cascade)
-        drowsiness_mobile_poc.TemporalViolation
-        config.PHONE_COOLDOWN
-
-    Maintains one PhoneDetector PER camera_id, same isolation reasoning as
-    the drowsiness worker above.
-    """
-    print(f"[phone-worker pid={os.getpid()}] starting", flush=True)
-
     from src.phone_detection import PhoneDetector
     from drowsiness_mobile_poc import TemporalViolation
     import config as cfg
@@ -322,104 +166,149 @@ def phone_worker_process(task_q, result_q, phone_model_path, phone_yolo_path, de
     if phone_yolo_path:
         cfg.PHONE_YOLO_FALLBACK_MODEL = str(phone_yolo_path)
 
-    camera_state = {}
-
-    def get_state(camera_id):
-        if camera_id not in camera_state:
-            model_path = (
-                phone_model_path
-                if phone_model_path and os.path.exists(phone_model_path)
-                else None
-            )
-            detector = PhoneDetector(model_path, device=device)
-            camera_state[camera_id] = {
-                "detector": detector,
-                "temporal": TemporalViolation("PHONE_USAGE", 0.0, cfg.PHONE_COOLDOWN),
-                "last_status_at": 0.0,
-            }
-            print(
-                f"[phone-worker] detector initialized for camera '{camera_id}'",
-                flush=True,
-            )
-        return camera_state[camera_id]
-
-    while True:
-        task = task_q.get()
-
-        if task is None:
-            print("[phone-worker] shutdown signal received", flush=True)
-            break
-
-        if task.get("control") == "REMOVE_CAMERA":
-            camera_state.pop(task["camera_id"], None)
-            print(
-                f"[phone-worker] released state for camera '{task['camera_id']}'",
-                flush=True,
-            )
-            continue
-
-        camera_id = task["camera_id"]
-
+    # ---- load models once for this camera -------------------------------
+    classifier = None
+    if drowsy_model_path and os.path.exists(drowsy_model_path):
         try:
-            frame = cv2.imdecode(
-                np.frombuffer(task["frame_bytes"], dtype=np.uint8),
-                cv2.IMREAD_COLOR,
-            )
-            if frame is None:
-                continue
-
-            video_time = task["video_time"]
-            state = get_state(camera_id)
-
-            p = state["detector"].process_frame(frame, video_time)
-
-            condition = bool(p.get("sustained_active", False))
-            confidence = float(p.get("confidence", 0.0) or 0.0)
-            event = state["temporal"].update(condition, video_time, confidence)
-
-            now = time.monotonic()
-            is_heartbeat_due = (
-                now - state["last_status_at"] >= NORMAL_STATUS_INTERVAL_SECONDS
-            )
-
-            if event is None and not is_heartbeat_due:
-                continue
-
-            state["last_status_at"] = now
-
-            if event == "START":
-                print(
-                    f"[phone-worker] 🚨 PHONE_USAGE START camera={camera_id} "
-                    f"mode={p.get('mode')} conf={confidence:.3f}",
-                    flush=True,
-                )
-
-            result_q.put(
-                {
-                    "domain": "phone",
-                    "connection_id": task["connection_id"],
-                    "camera_id": camera_id,
-                    "user_name": task["user_name"],
-                    "event": event,
-                    "active": state["temporal"].active,
-                    "label": p.get("label"),
-                    "mode": p.get("mode"),
-                    "confidence": round(confidence, 4),
-                    "peak_confidence": round(state["temporal"].peak_confidence, 4),
-                }
-            )
-
+            classifier = DrowsinessDetector(drowsy_model_path, device=device)
         except Exception as exc:
+            print(f"[camera-worker '{camera_id}'] drowsiness classifier disabled: {exc!r}", flush=True)
+
+    geometric = GeometricDrowsinessDetector()
+
+    phone_model = phone_model_path if phone_model_path and os.path.exists(phone_model_path) else None
+    phone_detector = PhoneDetector(phone_model, device=device)
+
+    drowsy_temporal = TemporalViolation("DROWSINESS", 0.0, cfg.DROWSINESS_COOLDOWN)
+    phone_temporal = TemporalViolation("PHONE_USAGE", 0.0, cfg.PHONE_COOLDOWN)
+
+    last_status_at = {"drowsiness": 0.0, "phone": 0.0}
+
+    # ---- per-domain pipelines, each run on its own thread ----------------
+    def run_drowsiness(frame, video_time):
+        if classifier is not None:
+            d = classifier.process_frame(frame, video_time)
+        else:
+            d = {"label": "DISABLED", "confidence": 0.0, "sustained_active": False}
+
+        geo = geometric.process_frame(frame, video_time)
+
+        classifier_active = bool(d.get("sustained_active", False))
+        geometric_active = bool(geo.get("sustained_active", False))
+
+        if cfg.DROWSINESS_COMBINE_MODE.upper() == "AND":
+            condition = classifier_active and geometric_active
+        else:
+            condition = classifier_active or geometric_active
+
+        confidence = float(d.get("confidence", 0.0) or 0.0)
+        event = drowsy_temporal.update(condition, video_time, confidence)
+
+        now = time.monotonic()
+        due = now - last_status_at["drowsiness"] >= NORMAL_STATUS_INTERVAL_SECONDS
+        if event is None and not due:
+            return None
+        last_status_at["drowsiness"] = now
+
+        if event == "START":
             print(
-                f"[phone-worker] ERROR on camera '{camera_id}': {exc!r}",
+                f"[camera-worker '{camera_id}'] \U0001f6a8 DROWSINESS START "
+                f"conf={confidence:.3f}",
                 flush=True,
             )
+
+        return {
+            "domain": "drowsiness",
+            "camera_id": camera_id,
+            "user_name": user_name,
+            "event": event,
+            "active": drowsy_temporal.active,
+            "label": d.get("label"),
+            "confidence": round(confidence, 4),
+            "peak_confidence": round(drowsy_temporal.peak_confidence, 4),
+            "ear": geo.get("ear"),
+            "perclos": geo.get("perclos"),
+        }
+
+    def run_phone(frame, video_time):
+        p = phone_detector.process_frame(frame, video_time)
+
+        condition = bool(p.get("sustained_active", False))
+        confidence = float(p.get("confidence", 0.0) or 0.0)
+        event = phone_temporal.update(condition, video_time, confidence)
+
+        now = time.monotonic()
+        due = now - last_status_at["phone"] >= NORMAL_STATUS_INTERVAL_SECONDS
+        if event is None and not due:
+            return None
+        last_status_at["phone"] = now
+
+        if event == "START":
+            print(
+                f"[camera-worker '{camera_id}'] \U0001f6a8 PHONE_USAGE START "
+                f"mode={p.get('mode')} conf={confidence:.3f}",
+                flush=True,
+            )
+
+        return {
+            "domain": "phone",
+            "camera_id": camera_id,
+            "user_name": user_name,
+            "event": event,
+            "active": phone_temporal.active,
+            "label": p.get("label"),
+            "mode": p.get("mode"),
+            "confidence": round(confidence, 4),
+            "peak_confidence": round(phone_temporal.peak_confidence, 4),
+        }
+
+    # ---- main loop: 1 frame in, both pipelines run concurrently ---------
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"det-{camera_id}") as pool:
+        while True:
+            task = task_q.get()  # blocks until a frame or shutdown sentinel
+
+            if task is None:
+                print(f"[camera-worker '{camera_id}'] shutdown signal received", flush=True)
+                break
+
+            try:
+                frame = cv2.imdecode(
+                    np.frombuffer(task["frame_bytes"], dtype=np.uint8),
+                    cv2.IMREAD_COLOR,
+                )
+                if frame is None:
+                    continue
+
+                video_time = task["video_time"]
+
+                futures = {
+                    pool.submit(run_drowsiness, frame, video_time): "drowsiness",
+                    pool.submit(run_phone, frame, video_time): "phone",
+                }
+
+                # Push each domain's result the instant IT finishes -- the
+                # faster pipeline never waits on the slower one.
+                for future in as_completed(futures):
+                    try:
+                        item = future.result()
+                    except Exception as exc:
+                        print(
+                            f"[camera-worker '{camera_id}'] "
+                            f"{futures[future]} pipeline error: {exc!r}",
+                            flush=True,
+                        )
+                        continue
+                    if item is not None:
+                        result_q.put(item)
+
+            except Exception as exc:
+                print(f"[camera-worker '{camera_id}'] frame error: {exc!r}", flush=True)
+
+    print(f"[camera-worker '{camera_id}' pid={os.getpid()}] exiting", flush=True)
 
 
 # =============================================================================
 # RESULT -> WEBSOCKET MESSAGE FORMATTING
-# (message "shape" follows the same style as the reference implementation:
-#  type / state / user_name / camera_id / timestamp)
 # =============================================================================
 
 def get_timestamp() -> str:
@@ -496,55 +385,41 @@ def build_message(item: dict) -> dict:
 
 state_lock = threading.Lock()
 
-active_clients: dict[int, dict] = {}          # connection_id -> info
-connection_out_queues: dict[int, "asyncio.Queue"] = {}  # connection_id -> per-camera outbox
-active_camera_ids: set[str] = set()
+active_clients: dict[int, dict] = {}     # connection_id -> info
+active_camera_workers: dict[str, dict] = {}  # camera_id -> {process, task_q, result_q}
 
 total_connections = 0
 active_connections = 0
 total_frames_received = 0
 total_frames_processed = 0
 total_alerts_sent = 0
-total_frames_dropped_drowsy = 0
-total_frames_dropped_phone = 0
+total_frames_dropped = 0
 
 
 # =============================================================================
-# DISPATCHER THREADS
-# Bridge a (blocking) multiprocessing result queue into the specific
-# camera's asyncio.Queue on the event loop thread. This is what makes each
-# camera's alert appear "at that camera's exact point in time" instead of
-# on some shared polling interval: the moment a worker process finishes a
-# frame for camera X, the result is routed straight to camera X's own
-# outgoing queue and flushed to its own WebSocket.
+# PER-CAMERA DISPATCHER THREAD
+# One of these is started per camera connection, reading ONLY that camera's
+# dedicated result queue and forwarding straight into that connection's own
+# asyncio outgoing queue -- no shared routing table needed, because the
+# 1-worker-per-camera design already gives 1:1 isolation.
 # =============================================================================
 
-def start_dispatcher(result_q, loop: asyncio.AbstractEventLoop, label: str) -> threading.Thread:
+def start_camera_dispatcher(
+    result_q, out_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, camera_id: str
+) -> threading.Thread:
     def _run():
         global total_alerts_sent
         while True:
             item = result_q.get()
             if item is None:
-                print(f"[dispatcher-{label}] shutdown signal received", flush=True)
                 break
-
-            connection_id = item.get("connection_id")
-
-            with state_lock:
-                out_q = connection_out_queues.get(connection_id)
-
-            if out_q is None:
-                # Camera already disconnected; drop the stale result.
-                continue
-
             if item.get("event") == "START":
                 with state_lock:
                     total_alerts_sent += 1
-
             message = build_message(item)
-            asyncio.run_coroutine_threadsafe(out_q.put(message), loop)
+            asyncio.run_coroutine_threadsafe(out_queue.put(message), loop)
 
-    t = threading.Thread(target=_run, daemon=True, name=f"dispatcher-{label}")
+    t = threading.Thread(target=_run, daemon=True, name=f"dispatcher-{camera_id}")
     t.start()
     return t
 
@@ -555,78 +430,33 @@ def start_dispatcher(result_q, loop: asyncio.AbstractEventLoop, label: str) -> t
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global drowsy_process, phone_process
-    global drowsy_dispatcher_thread, phone_dispatcher_thread
-
-    loop = asyncio.get_running_loop()
-
-    drowsy_process = mp.Process(
-        target=drowsiness_worker_process,
-        args=(task_queue_drowsy, result_queue_drowsy, DROWSINESS_MODEL_PATH, DEVICE),
-        name="drowsiness-worker",
-        daemon=True,
-    )
-    phone_process = mp.Process(
-        target=phone_worker_process,
-        args=(
-            task_queue_phone,
-            result_queue_phone,
-            PHONE_MODEL_PATH,
-            PHONE_YOLO_FALLBACK_MODEL_PATH,
-            DEVICE,
-        ),
-        name="phone-worker",
-        daemon=True,
-    )
-
-    drowsy_process.start()
-    phone_process.start()
-
-    drowsy_dispatcher_thread = start_dispatcher(result_queue_drowsy, loop, "drowsiness")
-    phone_dispatcher_thread = start_dispatcher(result_queue_phone, loop, "phone")
-
-    print(f"[main] drowsiness worker PID={drowsy_process.pid}", flush=True)
-    print(f"[main] phone worker PID={phone_process.pid}", flush=True)
-    print(f"[main] max concurrent cameras = {MAX_CONCURRENT_CAMERAS}", flush=True)
-
+    print(f"[main] ready -- max concurrent camera workers = {MAX_CONCURRENT_CAMERAS}", flush=True)
     yield
 
-    print("[main] shutting down...", flush=True)
+    print("[main] shutting down -- stopping all camera workers...", flush=True)
+    with state_lock:
+        workers = list(active_camera_workers.items())
 
-    for q in (task_queue_drowsy, task_queue_phone):
+    for camera_id, info in workers:
         try:
-            q.put_nowait(None)
+            info["task_q"].put_nowait(None)
         except Exception:
             pass
 
-    for p in (drowsy_process, phone_process):
-        p.join(timeout=5)
-        if p.is_alive():
-            p.terminate()
-
-    for q in (result_queue_drowsy, result_queue_phone):
+    for camera_id, info in workers:
+        info["process"].join(timeout=5)
+        if info["process"].is_alive():
+            info["process"].terminate()
         try:
-            q.put(None)
+            info["result_q"].put(None)
         except Exception:
             pass
 
 
 app = FastAPI(
     title="Multi-Camera Driver Drowsiness + Phone-Usage Backend",
-    version="4.0.0",
+    version="5.0.0",
     lifespan=lifespan,
-)
-
-# Allow the frontend to connect through a tunnel/public URL such as
-# wss://<ngrok-domain>.ngrok-free.dev and still hit the same FastAPI
-# websocket endpoint. The backend must not lock itself to localhost-only
-# browser origin policy while running behind a public proxy.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 
@@ -636,34 +466,28 @@ app.add_middleware(
 
 @app.get("/")
 async def home():
-    public_ws_base = os.environ.get("PUBLIC_WS_BASE", "ws://localhost:8000")
     return {
         "status": "success",
         "message": "Multi-camera drowsiness + phone-usage backend is running",
-        "workers": {
-            "drowsiness": "dedicated process (parallel)",
-            "phone": "dedicated process (parallel)",
-        },
+        "architecture": "1 dedicated GPU worker process per camera; "
+        "drowsiness + phone detectors run in parallel threads inside each worker",
         "max_concurrent_cameras": MAX_CONCURRENT_CAMERAS,
         "websocket_endpoint": "/video",
-        "example_frontend_url": f"{public_ws_base}/video",
     }
 
 
 @app.get("/health")
 async def health():
     with state_lock:
-        cameras = sorted(active_camera_ids)
         clients = dict(active_clients)
+        workers = {
+            camera_id: {
+                "pid": info["process"].pid,
+                "alive": info["process"].is_alive(),
+            }
+            for camera_id, info in active_camera_workers.items()
+        }
         alerts_sent = total_alerts_sent
-
-    def _qsize(q):
-        try:
-            return q.qsize()
-        except NotImplementedError:
-            return None
-
-    public_ws_base = os.environ.get("PUBLIC_WS_BASE", "ws://localhost:8000")
 
     return {
         "status": "ok",
@@ -672,21 +496,10 @@ async def health():
         "frames_received": total_frames_received,
         "frames_processed": total_frames_processed,
         "alerts_sent": alerts_sent,
-        "frames_dropped": {
-            "drowsiness_queue_full": total_frames_dropped_drowsy,
-            "phone_queue_full": total_frames_dropped_phone,
-        },
-        "active_cameras": cameras,
+        "frames_dropped": total_frames_dropped,
+        "active_camera_workers": workers,
         "clients": clients,
-        "queue_depth": {
-            "drowsiness_tasks": _qsize(task_queue_drowsy),
-            "phone_tasks": _qsize(task_queue_phone),
-        },
-        "worker_pids": {
-            "drowsiness": drowsy_process.pid if drowsy_process else None,
-            "phone": phone_process.pid if phone_process else None,
-        },
-        "public_stream_hint": f"{public_ws_base}/video",
+        "slots_used": f"{len(workers)}/{MAX_CONCURRENT_CAMERAS}",
     }
 
 
@@ -697,8 +510,7 @@ async def health():
 @app.websocket("/video")
 async def video_receiver(websocket: WebSocket):
     global total_connections, active_connections
-    global total_frames_received, total_frames_processed
-    global total_frames_dropped_drowsy, total_frames_dropped_phone
+    global total_frames_received, total_frames_processed, total_frames_dropped
 
     await websocket.accept()
 
@@ -717,6 +529,11 @@ async def video_receiver(websocket: WebSocket):
     camera_id: Optional[str] = None
 
     sender_task: Optional[asyncio.Task] = None
+    dispatcher_thread: Optional[threading.Thread] = None
+    task_q = None
+    result_q = None
+    worker_process = None
+
     connection_start = time.monotonic()
 
     try:
@@ -750,32 +567,57 @@ async def video_receiver(websocket: WebSocket):
             return
 
         # ---------------------------------------------------------------
-        # 2. ADMIT / REJECT (duplicate camera_id or too many cameras)
+        # 2. ADMIT / REJECT (duplicate camera_id or all worker slots full)
         # ---------------------------------------------------------------
         registration_error = None
         with state_lock:
-            if camera_id in active_camera_ids:
+            if camera_id in active_camera_workers:
                 registration_error = f"camera_id '{camera_id}' is already streaming"
-            elif len(active_camera_ids) >= MAX_CONCURRENT_CAMERAS:
+            elif len(active_camera_workers) >= MAX_CONCURRENT_CAMERAS:
                 registration_error = (
-                    f"Maximum of {MAX_CONCURRENT_CAMERAS} concurrent cameras reached"
+                    f"All {MAX_CONCURRENT_CAMERAS} camera worker slots are in use"
                 )
-            else:
-                active_camera_ids.add(camera_id)
 
         if registration_error:
             await websocket.send_json({"type": "ERROR", "message": registration_error})
             await websocket.close()
             return
 
-        out_queue: asyncio.Queue = asyncio.Queue()
+        # ---------------------------------------------------------------
+        # 3. SPIN UP A DEDICATED WORKER PROCESS FOR THIS CAMERA
+        # ---------------------------------------------------------------
+        task_q = mp.Queue(maxsize=TASK_QUEUE_MAXSIZE)
+        result_q = mp.Queue()
+
+        worker_process = mp.Process(
+            target=camera_worker_process,
+            args=(
+                task_q,
+                result_q,
+                camera_id,
+                user_name,
+                DROWSINESS_MODEL_PATH,
+                PHONE_MODEL_PATH,
+                PHONE_YOLO_FALLBACK_MODEL_PATH,
+                DEVICE,
+            ),
+            name=f"camera-worker-{camera_id}",
+            daemon=True,
+        )
+        worker_process.start()
+
         with state_lock:
-            connection_out_queues[connection_id] = out_queue
+            active_camera_workers[camera_id] = {
+                "process": worker_process,
+                "task_q": task_q,
+                "result_q": result_q,
+            }
             active_clients[connection_id] = {
                 "user_id": user_id,
                 "user_name": user_name,
                 "camera_id": camera_id,
                 "connected_at": get_timestamp(),
+                "worker_pid": worker_process.pid,
             }
 
         print("-" * 80)
@@ -784,7 +626,8 @@ async def video_receiver(websocket: WebSocket):
         print(f"User ID    : {user_id}")
         print(f"User Name  : {user_name}")
         print(f"Camera ID  : {camera_id}")
-        print(f"Active cameras now: {sorted(active_camera_ids)}")
+        print(f"Worker PID : {worker_process.pid}")
+        print(f"Slots used : {len(active_camera_workers)}/{MAX_CONCURRENT_CAMERAS}")
         print("-" * 80)
 
         await websocket.send_json(
@@ -798,10 +641,12 @@ async def video_receiver(websocket: WebSocket):
         )
 
         # ---------------------------------------------------------------
-        # 3. SENDER TASK
-        # Delivers this camera's own alerts/status the instant a worker
-        # process produces them, independent of the receive loop below.
+        # 4. SENDER TASK + DISPATCHER
         # ---------------------------------------------------------------
+        out_queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        dispatcher_thread = start_camera_dispatcher(result_q, out_queue, loop, camera_id)
+
         async def sender_loop():
             while True:
                 message = await out_queue.get()
@@ -810,41 +655,24 @@ async def video_receiver(websocket: WebSocket):
         sender_task = asyncio.create_task(sender_loop())
 
         # ---------------------------------------------------------------
-        # 4. RECEIVE CONTINUOUS JPEG FRAMES
-        # Each frame is fanned out to BOTH worker queues so drowsiness and
-        # phone detection run in parallel for the same frame.
+        # 5. RECEIVE CONTINUOUS JPEG FRAMES -> this camera's own worker
         # ---------------------------------------------------------------
         while True:
             data = await websocket.receive_bytes()
             total_frames_received += 1
 
-            # Cheap sanity check without a full decode (decode happens
-            # inside each worker process so it also benefits from the
-            # two-process parallelism instead of serializing on the
-            # single asyncio event loop).
             if not data:
                 continue
 
             total_frames_processed += 1
             video_time = time.monotonic() - connection_start
 
-            task = {
-                "connection_id": connection_id,
-                "camera_id": camera_id,
-                "user_name": user_name,
-                "frame_bytes": data,
-                "video_time": video_time,
-            }
+            task = {"frame_bytes": data, "video_time": video_time}
 
             try:
-                task_queue_drowsy.put_nowait(task)
+                task_q.put_nowait(task)
             except queue.Full:
-                total_frames_dropped_drowsy += 1
-
-            try:
-                task_queue_phone.put_nowait(task)
-            except queue.Full:
-                total_frames_dropped_phone += 1
+                total_frames_dropped += 1
 
     except WebSocketDisconnect:
         print()
@@ -874,20 +702,32 @@ async def video_receiver(websocket: WebSocket):
 
         with state_lock:
             active_clients.pop(connection_id, None)
-            connection_out_queues.pop(connection_id, None)
-            active_camera_ids.discard(camera_id)
+            active_camera_workers.pop(camera_id, None)
 
-        # Free that camera's model/timer state inside both worker
-        # processes so it doesn't sit in memory forever.
-        if camera_id:
-            control = {"control": "REMOVE_CAMERA", "camera_id": camera_id}
-            for q in (task_queue_drowsy, task_queue_phone):
-                try:
-                    q.put_nowait(control)
-                except queue.Full:
-                    pass
+        # Stop this camera's dedicated worker process.
+        if task_q is not None:
+            try:
+                task_q.put_nowait(None)
+            except Exception:
+                pass
+
+        if worker_process is not None:
+            worker_process.join(timeout=5)
+            if worker_process.is_alive():
+                worker_process.terminate()
+
+        # Stop this camera's dispatcher thread.
+        if result_q is not None:
+            try:
+                result_q.put(None)
+            except Exception:
+                pass
 
         print(f"Active connections: {active_connections}")
+        print(
+            f"Camera worker slots free: "
+            f"{MAX_CONCURRENT_CAMERAS - len(active_camera_workers)}/{MAX_CONCURRENT_CAMERAS}"
+        )
 
 
 # =============================================================================
@@ -896,8 +736,8 @@ async def video_receiver(websocket: WebSocket):
 
 if __name__ == "__main__":
     # "spawn" is the safe cross-platform choice (required on Windows, and
-    # avoids fork-related surprises with OpenCV/PyTorch/MediaPipe threads
-    # on Linux/macOS too).
+    # avoids fork-related surprises with OpenCV/PyTorch/MediaPipe/CUDA on
+    # Linux too).
     try:
         mp.set_start_method("spawn")
     except RuntimeError:
@@ -905,13 +745,4 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "8000"))
-
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-        proxy_headers=True,
-        forwarded_allow_ips="*",
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)
