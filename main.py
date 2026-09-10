@@ -103,7 +103,24 @@ if str(SCRIPT_DIR) not in sys.path:
 # still live in config.py and are read from there, untouched)
 # =============================================================================
 
-DEVICE = os.environ.get("DRIVER_SAFETY_DEVICE", "cpu")  # "cpu" or "cuda"
+def _resolve_device() -> str:
+    """
+    Respect DRIVER_SAFETY_DEVICE if the operator explicitly set it
+    (including an explicit "cpu"). Only when it is unset do we probe for
+    CUDA -- this avoids silently forcing CPU on a GPU box while still
+    never overriding an explicit choice.
+    """
+    explicit = os.environ.get("DRIVER_SAFETY_DEVICE")
+    if explicit:
+        return explicit
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+DEVICE = _resolve_device()  # "cpu" or "cuda"
 
 DROWSINESS_MODEL_PATH = os.environ.get(
     "DROWSINESS_MODEL_PATH", str(SCRIPT_DIR / "drowsiness.pt")
@@ -123,9 +140,19 @@ MAX_CONCURRENT_CAMERAS = int(os.environ.get("MAX_CONCURRENT_CAMERAS", "3"))
 # How frequently a heartbeat/normal status is sent per camera per domain.
 NORMAL_STATUS_INTERVAL_SECONDS = 0.5
 
-# Bounded per-camera task queue so a stalled worker can't grow memory
-# without limit or stall the WebSocket receive loop.
-TASK_QUEUE_MAXSIZE = 12
+# Per-camera task "queue" is intentionally a LATEST-FRAME buffer, not a
+# FIFO backlog: maxsize=1 means at most one pending frame ever sits
+# between the WebSocket receiver and the inference worker. When a new
+# frame arrives while one is already pending, the receive loop below
+# discards the stale pending frame and replaces it with the new one, so
+# the worker always picks up the newest frame instead of working through
+# a queue of increasingly-old ones (which is what produced the ~10s of
+# visible latency before this change).
+TASK_QUEUE_MAXSIZE = 1
+
+# How often (seconds) to print the compact per-camera latency/FPS status
+# line from inside each camera worker process.
+STATUS_LOG_INTERVAL_SECONDS = 1.0
 
 # Message types that get printed to the server terminal at the exact
 # moment they are sent to a camera's mobile app, so you can see on the
@@ -275,6 +302,25 @@ def camera_worker_process(
             "peak_confidence": round(phone_temporal.peak_confidence, 4),
         }
 
+    def _pending_count() -> int:
+        # task_q.qsize() is unreliable/unimplemented on some platforms
+        # (e.g. macOS); never let a stats print crash the worker over it.
+        try:
+            return task_q.qsize()
+        except Exception:
+            return -1
+
+    # Lightweight rolling counters for the once-per-second status line.
+    # NOTE: time.monotonic() is CLOCK_MONOTONIC, which (on Linux) is a
+    # system-wide clock shared across processes, not a per-process
+    # counter -- so timestamps taken in the main process (when a frame is
+    # received) and read back here (in this worker process) are directly
+    # comparable, which is what makes the frame_age measurement valid.
+    stats_frames = 0
+    stats_frame_age_sum = 0.0
+    stats_inference_sum = 0.0
+    stats_last_log = time.monotonic()
+
     # ---- main loop: 1 frame in, both pipelines run concurrently ---------
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"det-{camera_id}") as pool:
         while True:
@@ -283,6 +329,10 @@ def camera_worker_process(
             if task is None:
                 print(f"[camera-worker '{camera_id}'] shutdown signal received", flush=True)
                 break
+
+            inference_start = time.monotonic()
+            received_at = task.get("received_at")
+            frame_age = (inference_start - received_at) if received_at is not None else 0.0
 
             try:
                 frame = cv2.imdecode(
@@ -313,6 +363,30 @@ def camera_worker_process(
                         continue
                     if item is not None:
                         result_q.put(item)
+
+                inference_duration = time.monotonic() - inference_start
+
+                # ---- compact once-per-second latency/FPS status line ----
+                stats_frames += 1
+                stats_frame_age_sum += frame_age
+                stats_inference_sum += inference_duration
+                now = time.monotonic()
+                elapsed = now - stats_last_log
+                if elapsed >= STATUS_LOG_INTERVAL_SECONDS:
+                    fps = stats_frames / elapsed if elapsed > 0 else 0.0
+                    avg_frame_age = stats_frame_age_sum / stats_frames
+                    avg_inference = stats_inference_sum / stats_frames
+                    print(
+                        f"[{camera_id}] FPS={fps:.1f} | "
+                        f"frame_age={avg_frame_age:.2f}s | "
+                        f"inference={avg_inference:.2f}s | "
+                        f"pending={_pending_count()}",
+                        flush=True,
+                    )
+                    stats_frames = 0
+                    stats_frame_age_sum = 0.0
+                    stats_inference_sum = 0.0
+                    stats_last_log = now
 
             except Exception as exc:
                 print(f"[camera-worker '{camera_id}'] frame error: {exc!r}", flush=True)
@@ -684,13 +758,38 @@ async def video_receiver(websocket: WebSocket):
                 continue
 
             total_frames_processed += 1
-            video_time = time.monotonic() - connection_start
+            received_at = time.monotonic()
+            video_time = received_at - connection_start
 
-            task = {"frame_bytes": data, "video_time": video_time}
+            # received_at lets the worker (a different process, but on
+            # the same machine so CLOCK_MONOTONIC is shared) compute how
+            # stale a frame is the instant it starts inference.
+            task = {
+                "frame_bytes": data,
+                "video_time": video_time,
+                "received_at": received_at,
+            }
 
+            # LATEST-FRAME buffer, not FIFO: with TASK_QUEUE_MAXSIZE=1,
+            # the common case (worker keeps up) is an empty queue and
+            # this succeeds immediately, never blocking the receiver.
+            # If the worker is still busy with the previous frame, the
+            # queue is full -- in that case we discard the ALREADY
+            # PENDING (older) frame and enqueue this newer one instead,
+            # rather than dropping the incoming frame and leaving the
+            # stale one to be processed. This is what guarantees the
+            # worker always picks up the newest available frame.
             try:
                 task_q.put_nowait(task)
             except queue.Full:
+                try:
+                    task_q.get_nowait()  # discard the stale pending frame
+                except queue.Empty:
+                    pass  # worker grabbed it a moment ago -- fine
+                try:
+                    task_q.put_nowait(task)
+                except queue.Full:
+                    pass  # rare race with the worker; drop this frame instead
                 total_frames_dropped += 1
 
     except WebSocketDisconnect:
