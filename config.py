@@ -92,16 +92,6 @@ DISTRACTION_COOLDOWN = 5.0
 # --------------------------------------------------------------------------
 # HEAD POSE / LOOKING AWAY (MediaPipe fallback)
 # --------------------------------------------------------------------------
-# Camera is assumed dash-mounted, straight in front of the driver seat, so
-# yaw=0 means facing the road and a single symmetric left/right threshold
-# is used (no per-install calibration needed for that part).
-#
-# "Not focused" is now flagged two ways, per requirement:
-#   1. CONTINUOUS: looking away >= HEAD_POSE_AWAY_DURATION seconds straight
-#      (raised from 1.5s -> 10s).
-#   2. FREQUENT: HEAD_POSE_FREQUENT_GLANCE_COUNT+ separate glances away
-#      within a HEAD_POSE_FREQUENT_GLANCE_WINDOW-second rolling window,
-#      even if none individually reaches 10s.
 HEAD_POSE_AWAY_DURATION = 10.0        # seconds of CONTINUOUS look-away before flagged
 HEAD_POSE_YAW_THRESHOLD_DEG = 25.0    # degrees left/right considered "away"
 HEAD_POSE_PITCH_THRESHOLD_DEG = 20.0  # degrees up/down considered "away"
@@ -112,18 +102,8 @@ HEAD_POSE_FREQUENT_GLANCE_COUNT = 3       # N+ separate glances within window ->
 # DROWSINESS - EYE ASPECT RATIO (EAR) / MOUTH ASPECT RATIO (MAR)
 # GEOMETRIC CROSS-CHECK (src/drowsiness_geometric.py)
 # --------------------------------------------------------------------------
-# Runs independently of the drowsiness .pt classifier. Combined per
-# DROWSINESS_COMBINE_MODE: "OR" (either signal triggers, catches more real
-# cases given the classifier was observed to be noisy/inconsistent on real
-# test footage) or "AND" (both must agree, more conservative).
 DROWSINESS_COMBINE_MODE = "OR"
 
-# EAR_CLOSED_THRESHOLD_FLOOR is a fixed sanity floor used until enough
-# samples exist to compute a reliable adaptive baseline (see
-# EAR_BASELINE_* below) -- real testing against two different camera
-# setups showed open-eye EAR baselines ranging ~0.20 (distant/lower-res
-# camera) to ~0.28 (closer camera), so a single fixed threshold alone is
-# not portable across setups.
 EAR_CLOSED_THRESHOLD_FLOOR = 0.15
 EAR_CLOSED_DURATION = 1.5             # seconds of sustained closed-eyes to flag drowsy
 EAR_COOLDOWN = 5.0
@@ -136,12 +116,6 @@ EAR_CLOSED_RATIO = 0.72               # flag closed when EAR drops below (baseli
 MAR_YAWN_THRESHOLD = 0.55             # mouth-height/width ratio above this = wide open (yawn)
 MAR_YAWN_DURATION = 1.5
 
-# PERCLOS (PERcentage of eye CLOSure) -- the actual industry-standard
-# drowsiness metric (Wierwille et al.), not a POC invention: percentage of
-# time the eyes are closed over a rolling window, rather than a single
-# "closed right now for N seconds" check. Catches heavy-lidded/frequent-
-# long-blink patterns that never individually reach EAR_CLOSED_DURATION but
-# still indicate drowsiness in aggregate.
 PERCLOS_WINDOW_SECONDS = 60.0    # rolling window over which % closed is measured
 PERCLOS_THRESHOLD = 0.15         # >=15% of the window spent closed -> drowsy (literature-cited value)
 PERCLOS_MIN_WINDOW_COVERAGE = 0.5  # need at least half the window's worth of samples before trusting it
@@ -160,8 +134,6 @@ PHONE_YOLO_CONF = 0.35                # confidence needed from the YOLOv8 'cell 
 # --------------------------------------------------------------------------
 # LANE DEPARTURE
 # --------------------------------------------------------------------------
-# Normalized offset of vehicle/camera center from lane center, as a fraction
-# of lane width. Must be tuned per-camera-mounting-geometry.
 LANE_OFFSET_THRESHOLD = 0.35
 LANE_DEPARTURE_DURATION = 1.0
 LANE_DEPARTURE_COOLDOWN = 5.0
@@ -174,7 +146,6 @@ DEFAULT_FRAME_SKIP = 0   # 0 = process every frame
 # --------------------------------------------------------------------------
 # RISK ENGINE RULES (see src/risk_engine.py for logic)
 # --------------------------------------------------------------------------
-# These are illustrative POC rules only, not scientifically validated.
 RISK_LEVELS = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
 RISK_RULES = {
@@ -184,7 +155,6 @@ RISK_RULES = {
     "phone": "HIGH",
     "drowsiness": "HIGH",
     "lane_departure": "MEDIUM",
-    # combinations (checked in risk_engine.py) escalate to CRITICAL
     "drowsiness+lane_departure": "CRITICAL",
     "phone+lane_departure": "CRITICAL",
 }

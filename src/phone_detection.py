@@ -1,56 +1,3 @@
-# """
-# src/phone_detection.py
-# =======================
-# Wraps the local phone-usage model. Uses whatever classes the model
-# actually reports (e.g. "phone" / "no_phone", or detection classes like
-# "cell phone").
-# """
-
-# from src.detector_base import GenericFrameModel
-# from src.event_manager import TemporalFlag
-# import config
-
-# PHONE_LABEL_HINTS = ["phone", "mobile", "cell"]
-# NEGATIVE_HINTS = ["no_phone", "no-phone", "none", "background", "negative"]
-
-
-# class PhoneDetector:
-#     def __init__(self, model_path: str, device: str = "cpu"):
-#         self.model = GenericFrameModel(model_path, device=device)
-#         self.flag = TemporalFlag(
-#             name="PHONE_USAGE",
-#             duration_required=config.PHONE_DURATION,
-#             cooldown=config.PHONE_COOLDOWN,
-#         )
-#         self.last_label = "UNKNOWN"
-#         self.last_conf = 0.0
-
-#     def _is_phone_label(self, label: str) -> bool:
-#         label_lower = label.lower()
-#         if any(neg in label_lower for neg in NEGATIVE_HINTS):
-#             return False
-#         return any(hint in label_lower for hint in PHONE_LABEL_HINTS)
-
-#     def process_frame(self, frame_bgr, video_time: float):
-#         try:
-#             label, conf, _extra = self.model.predict(frame_bgr)
-#         except RuntimeError as e:
-#             return {"label": "ERROR", "confidence": 0.0, "sustained_active": False,
-#                      "event": None, "error": str(e)}
-
-#         self.last_label = label
-#         self.last_conf = conf
-
-#         condition = self._is_phone_label(label) and conf >= config.PHONE_CONFIDENCE
-#         event = self.flag.update(condition, video_time, confidence=conf)
-
-#         return {
-#             "label": label,
-#             "confidence": conf,
-#             "sustained_active": self.flag.is_active,
-#             "event": event,
-#         }
-
 """
 src/phone_detection.py
 =======================
@@ -93,9 +40,15 @@ import os
 from src.detector_base import GenericFrameModel
 from src.event_manager import TemporalFlag
 from src.pose_utils import PoseGate
+from src.label_utils import label_matches_hints
 import config
 
 PHONE_LABEL_HINTS = ["phone", "mobile", "cell"]
+# Kept as an extra explicit safety net for exact/underscore/hyphen forms,
+# but the real guard is label_matches_hints()'s negation-aware token check
+# below -- a raw substring check alone would match "No Phone" (space) too,
+# the same bug that was previously causing false DROWSINESS alerts on
+# "Non Drowsy" frames. See src/label_utils.py.
 NEGATIVE_HINTS = ["no_phone", "no-phone", "none", "background", "negative"]
 
 _YOLO_COCO_PHONE_CLASS_NAME = "cell phone"
@@ -139,7 +92,7 @@ class PhoneDetector:
         label_lower = label.lower()
         if any(neg in label_lower for neg in NEGATIVE_HINTS):
             return False
-        return any(hint in label_lower for hint in PHONE_LABEL_HINTS)
+        return label_matches_hints(label, PHONE_LABEL_HINTS)
 
     def _load_yolo_fallback(self):
         if self._yolo_fallback_attempted:
@@ -214,9 +167,6 @@ class PhoneDetector:
                 confirmed = True
                 ratio = gate.get("wrist_target_distance_ratio")
                 target = gate.get("target", "ear")
-                # Whichever posture target matched (ear or mouth) has its own
-                # distance-ratio threshold; use the matching one to normalize
-                # the inferred confidence to roughly [0, 1].
                 threshold = (
                     config.PHONE_HAND_MOUTH_DISTANCE_RATIO if target == "mouth"
                     else config.PHONE_HAND_EAR_DISTANCE_RATIO
@@ -230,9 +180,6 @@ class PhoneDetector:
                 conf = pose_conf
                 mode = "POSTURE_INFERRED"
             else:
-                # Nothing found by any method this frame -- keep whatever
-                # direct-check label we have for display/debugging,
-                # preferring the classifier's own verdict over YOLOv8's.
                 if classifier_label is not None:
                     label, conf = classifier_label, classifier_conf
                 elif fallback_label is not None:

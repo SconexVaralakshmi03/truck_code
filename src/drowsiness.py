@@ -9,12 +9,20 @@ matching against the model's own reported class names).
 
 from src.detector_base import GenericFrameModel
 from src.event_manager import TemporalFlag
+from src.label_utils import label_matches_hints
 import config
 
 
 # Labels we treat as "drowsy" if present in the model's class list. If the
 # model's real classes differ, edit this list to match — we do not invent
 # classes that aren't actually in the model.
+#
+# IMPORTANT: matching is negation-aware (src/label_utils.py), NOT a raw
+# substring check. A raw `"drowsy" in label.lower()` check would also match
+# "Non Drowsy" / "Not Drowsy" (since "drowsy" is a substring of both) --
+# that was previously causing a DROWSINESS_ALERT on frames the classifier
+# itself labeled "Non Drowsy" at 90%+ confidence, i.e. backwards, which is
+# what produced near-constant false alerts on live streams.
 DROWSY_LABEL_HINTS = ["drowsy", "sleep", "yawn", "closed", "fatigue"]
 
 
@@ -38,8 +46,7 @@ class DrowsinessDetector:
         self.last_conf = 0.0
 
     def _is_drowsy_label(self, label: str) -> bool:
-        label_lower = label.lower()
-        return any(hint in label_lower for hint in DROWSY_LABEL_HINTS)
+        return label_matches_hints(label, DROWSY_LABEL_HINTS)
 
     def process_frame(self, frame_bgr, video_time: float, face_present: bool = True):
         """
