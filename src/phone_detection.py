@@ -125,6 +125,11 @@ class PhoneDetector:
             name="PHONE_USAGE",
             duration_required=config.PHONE_DURATION,
             cooldown=config.PHONE_COOLDOWN,
+            # Same real-time jitter tolerance as drowsiness -- one missed
+            # detection in the middle of a real, ongoing phone-usage
+            # episode (motion blur, brief occlusion, a dropped frame)
+            # shouldn't restart the 2s timer from zero.
+            grace_period=config.PHONE_GRACE_PERIOD,
         )
         self.last_label = "UNKNOWN"
         self.last_conf = 0.0

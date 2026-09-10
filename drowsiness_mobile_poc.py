@@ -179,12 +179,18 @@ class TemporalViolation:
     It also records the peak confidence observed during the active event.
     """
 
-    def __init__(self, name, duration_required, cooldown):
+    def __init__(self, name, duration_required, cooldown, grace_period=0.0):
         self.name = name
         self.duration_required = float(duration_required)
         self.cooldown = float(cooldown)
+        # See src.event_manager.TemporalFlag.grace_period -- same idea:
+        # tolerate a short streak of "condition False" frames (live-feed
+        # jitter/dropped frames/one-frame misreads) without resetting the
+        # sustained timer or flapping an already-active event.
+        self.grace_period = float(grace_period)
 
         self.condition_since = None
+        self.false_since = None
         self.active = False
         self.last_end_time = None
         self.last_confidence = 0.0
@@ -195,6 +201,7 @@ class TemporalViolation:
         self.last_confidence = confidence
 
         if condition:
+            self.false_since = None
             self.peak_confidence = max(self.peak_confidence, confidence)
 
             if self.condition_since is None:
@@ -212,7 +219,14 @@ class TemporalViolation:
 
             return None
 
+        if self.grace_period > 0 and self.condition_since is not None:
+            if self.false_since is None:
+                self.false_since = video_time
+            if video_time - self.false_since < self.grace_period:
+                return None  # still within grace -- treat as a blip
+
         self.condition_since = None
+        self.false_since = None
 
         if self.active:
             self.active = False
@@ -461,16 +475,20 @@ def main():
     # aggregators do NOT add another duration on top (that would accidentally
     # turn 2s into ~4s). They only combine/track the already-temporal results
     # and handle evidence/logging.
+    import config as _cfg  # local alias, just for the grace-period constants
+
     drowsiness_temporal = TemporalViolation(
         "DROWSINESS",
         0.0,
         DROWSINESS_COOLDOWN,
+        grace_period=_cfg.DROWSINESS_GRACE_PERIOD,
     )
 
     phone_temporal = TemporalViolation(
         "PHONE_USAGE",
         0.0,
         PHONE_COOLDOWN,
+        grace_period=_cfg.PHONE_GRACE_PERIOD,
     )
 
     frame_number = 0
@@ -514,8 +532,17 @@ def main():
             # DROWSINESS
             # ==============================================================
 
+            # Geometric/MediaPipe stage first -- it tells us whether a face
+            # was actually found this frame, which gates the classifier
+            # call right below (see config.DROWSINESS_REQUIRE_FACE and
+            # src/drowsiness.py) so empty/mispointed frames never get
+            # scored "drowsy" and skip the heavier classifier call.
+            geo = geometric_drowsiness.process_frame(frame, video_time)
+            face_present = geo.get("face_detected")
+            face_present = True if face_present is None else bool(face_present)
+
             if drowsiness_classifier:
-                d = drowsiness_classifier.process_frame(frame, video_time)
+                d = drowsiness_classifier.process_frame(frame, video_time, face_present=face_present)
             else:
                 d = {
                     "label": "DISABLED",
@@ -523,8 +550,6 @@ def main():
                     "sustained_active": False,
                     "event": None,
                 }
-
-            geo = geometric_drowsiness.process_frame(frame, video_time)
 
             classifier_active = bool(d.get("sustained_active", False))
             geometric_active = bool(geo.get("sustained_active", False))

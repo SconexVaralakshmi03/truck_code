@@ -219,19 +219,37 @@ def camera_worker_process(
     phone_model = phone_model_path if phone_model_path and os.path.exists(phone_model_path) else None
     phone_detector = PhoneDetector(phone_model, device=device)
 
-    drowsy_temporal = TemporalViolation("DROWSINESS", 0.0, cfg.DROWSINESS_COOLDOWN)
-    phone_temporal = TemporalViolation("PHONE_USAGE", 0.0, cfg.PHONE_COOLDOWN)
+    drowsy_temporal = TemporalViolation(
+        "DROWSINESS", 0.0, cfg.DROWSINESS_COOLDOWN,
+        grace_period=cfg.DROWSINESS_GRACE_PERIOD,
+    )
+    phone_temporal = TemporalViolation(
+        "PHONE_USAGE", 0.0, cfg.PHONE_COOLDOWN,
+        grace_period=cfg.PHONE_GRACE_PERIOD,
+    )
 
     last_status_at = {"drowsiness": 0.0, "phone": 0.0}
 
     # ---- per-domain pipelines, each run on its own thread ----------------
     def run_drowsiness(frame, video_time):
+        # Geometric/MediaPipe stage runs FIRST: it's what tells us whether
+        # there's actually a face in this frame at all. That answer then
+        # gates the classifier call below (config.DROWSINESS_REQUIRE_FACE),
+        # so an empty/mispointed frame (camera settling, driver not yet
+        # seated, dash/ceiling in view) never gets scored as "drowsy" by a
+        # classifier that has no concept of "no driver present" -- and we
+        # skip the heavier classifier inference call on those frames too.
+        geo = geometric.process_frame(frame, video_time)
+        face_present = geo.get("face_detected")
+        # None means "unknown" (geometric stage unavailable) -- don't block
+        # the classifier in that case, only when we positively know there's
+        # no face.
+        face_present = True if face_present is None else bool(face_present)
+
         if classifier is not None:
-            d = classifier.process_frame(frame, video_time)
+            d = classifier.process_frame(frame, video_time, face_present=face_present)
         else:
             d = {"label": "DISABLED", "confidence": 0.0, "sustained_active": False}
-
-        geo = geometric.process_frame(frame, video_time)
 
         classifier_active = bool(d.get("sustained_active", False))
         geometric_active = bool(geo.get("sustained_active", False))

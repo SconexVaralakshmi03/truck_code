@@ -43,12 +43,39 @@ DROWSINESS_CONFIDENCE = 0.70          # min confidence to count a frame as "drow
 DROWSINESS_DURATION = 2.0             # seconds of sustained drowsy frames to trigger event
 DROWSINESS_COOLDOWN = 5.0             # seconds before the same event can re-trigger
 
+# Only let the drowsiness *classifier* vote "drowsy" on frames where a face
+# was actually found this frame (by the geometric/MediaPipe stage that runs
+# right before it). This is what stops a driverless / mispointed camera
+# frame (e.g. dash camera briefly showing the ceiling/ door, nobody in
+# seat) from being scored as "drowsy" by the .pt classifier, which -- unlike
+# the EAR/PERCLOS path -- has no built-in concept of "is there even a face
+# here". Also skips running the (comparatively heavy) classifier entirely
+# on no-face frames, which is a latency win, not just an accuracy one.
+DROWSINESS_REQUIRE_FACE = True
+
+# GRACE PERIOD (real-time robustness): live/WebSocket frames are noisier
+# than a clean prerecorded video -- a single dropped frame, a momentary
+# blink misread, or one flaky classifier call can flip "drowsy" -> "not
+# drowsy" for exactly one frame in the middle of a real, ongoing drowsy
+# spell. Previously ANY single non-drowsy frame reset the sustained-timer
+# to zero, so a real ~2s drowsy event spanning one bad frame could not
+# reliably reach DROWSINESS_DURATION and would silently keep restarting
+# instead of firing -- and conversely, once it does start rapid alternation
+# reads as repeated START/END "multi-frame" spam. GRACE_PERIOD lets the
+# sustained timer tolerate short gaps (<= this many seconds of consecutive
+# "condition false" frames) without resetting, while a gap longer than this
+# still means "the condition genuinely ended". This does NOT lower
+# DROWSINESS_DURATION/CONFIDENCE -- those thresholds are unchanged; this
+# only makes reaching them robust to normal frame-to-frame jitter.
+DROWSINESS_GRACE_PERIOD = 0.5
+
 # --------------------------------------------------------------------------
 # PHONE USAGE
 # --------------------------------------------------------------------------
 PHONE_CONFIDENCE = 0.70
 PHONE_DURATION = 2.0
 PHONE_COOLDOWN = 5.0
+PHONE_GRACE_PERIOD = 0.5              # same jitter-tolerance idea as above
 
 # --------------------------------------------------------------------------
 # DISTRACTION
@@ -100,6 +127,7 @@ DROWSINESS_COMBINE_MODE = "OR"
 EAR_CLOSED_THRESHOLD_FLOOR = 0.15
 EAR_CLOSED_DURATION = 1.5             # seconds of sustained closed-eyes to flag drowsy
 EAR_COOLDOWN = 5.0
+EAR_GRACE_PERIOD = 0.4                # tolerate brief single-frame blink/tracking noise
 EAR_BASELINE_WINDOW_SAMPLES = 450     # rolling window of recent "eyes open" EAR readings
 EAR_BASELINE_MIN_SAMPLES = 60         # need this many samples before trusting the adaptive baseline
 EAR_BASELINE_PERCENTILE = 90          # percentile of recent history used as "this person's open-eye EAR"

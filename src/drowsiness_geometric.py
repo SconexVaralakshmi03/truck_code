@@ -105,11 +105,15 @@ class GeometricDrowsinessDetector:
             name="EAR_EYES_CLOSED",
             duration_required=config.EAR_CLOSED_DURATION,
             cooldown=config.EAR_COOLDOWN,
+            # Tolerate a brief face-mesh tracking miss/blink-detection blip
+            # without resetting the closed-eyes timer -- see config.py.
+            grace_period=config.EAR_GRACE_PERIOD,
         )
         self.yawn_flag = TemporalFlag(
             name="MAR_YAWN",
             duration_required=config.MAR_YAWN_DURATION,
             cooldown=config.EAR_COOLDOWN,
+            grace_period=config.EAR_GRACE_PERIOD,
         )
 
         # Rolling baseline of recent EAR readings for the adaptive threshold.
@@ -169,6 +173,14 @@ class GeometricDrowsinessDetector:
                 "eyes_closed": False, "yawning": False, "sustained_active": False,
                 "eye_event": None, "yawn_event": None,
                 "perclos": None, "perclos_active": False, "perclos_event": None,
+                # MediaPipe itself is unavailable -- we genuinely don't know
+                # if there's a face or not, so don't claim either way. The
+                # classifier-side face gate (config.DROWSINESS_REQUIRE_FACE)
+                # treats face_detected=None as "unknown -> don't block it",
+                # since blocking the classifier entirely whenever this
+                # optional geometric stage isn't installed would silently
+                # disable drowsiness detection altogether.
+                "face_detected": None,
                 "error": self.unavailable_reason,
             }
 
@@ -187,6 +199,7 @@ class GeometricDrowsinessDetector:
                 "sustained_active": self.eye_flag.is_active or self.yawn_flag.is_active or self._was_perclos_active,
                 "eye_event": eye_event, "yawn_event": yawn_event,
                 "perclos": None, "perclos_active": self._was_perclos_active, "perclos_event": None,
+                "face_detected": False,
                 "error": "NO_FACE",
             }
 
@@ -231,4 +244,5 @@ class GeometricDrowsinessDetector:
             "perclos": perclos_ratio,
             "perclos_active": perclos_active,
             "perclos_event": perclos_event,
+            "face_detected": True,
         }

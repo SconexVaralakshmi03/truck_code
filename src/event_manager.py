@@ -41,8 +41,17 @@ class TemporalFlag:
     name: str
     duration_required: float     # seconds condition must hold to trigger START
     cooldown: float               # seconds after END before it can START again
+    # Seconds of consecutive "condition_true=False" frames that are
+    # tolerated WITHOUT resetting the sustained-duration timer. 0.0 keeps
+    # the original strict "any single false frame resets it" behavior.
+    # Non-zero makes the timer robust to the kind of one-frame flicker a
+    # live/WebSocket feed produces (dropped frame, momentary misread) that
+    # would otherwise keep a real, ongoing condition from ever reaching
+    # duration_required, or cause rapid START/END flapping once it does.
+    grace_period: float = 0.0
 
     _condition_since: Optional[float] = field(default=None, init=False)
+    _false_since: Optional[float] = field(default=None, init=False)
     _active: bool = field(default=False, init=False)
     _last_end_time: Optional[float] = field(default=None, init=False)
     _last_confidence: float = field(default=0.0, init=False)
@@ -54,6 +63,7 @@ class TemporalFlag:
         Returns one of: None, "START", "END"
         """
         if condition_true:
+            self._false_since = None  # any true frame clears a pending gap
             self._last_confidence = confidence
             self._peak_confidence = max(self._peak_confidence, confidence)
 
@@ -72,7 +82,19 @@ class TemporalFlag:
                     return "START"
             return None
         else:
+            if self.grace_period > 0 and self._condition_since is not None:
+                # Within grace: treat this false frame as a blip, not a
+                # real end -- keep the sustained-timer running instead of
+                # resetting it, as long as the false streak itself stays
+                # within grace_period.
+                if self._false_since is None:
+                    self._false_since = video_time
+                if video_time - self._false_since < self.grace_period:
+                    return None
+                # Gap outlasted the grace period -- genuinely ended.
+
             self._condition_since = None
+            self._false_since = None
             if self._active:
                 self._active = False
                 self._last_end_time = video_time
